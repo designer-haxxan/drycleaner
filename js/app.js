@@ -1,37 +1,30 @@
-// Application bootstrap: service worker, database, authentication gate, navigation and routing.
-import { CONFIG } from './config.js';
+// Application bootstrap: service worker, database, authentication gate, navigation, language and routing.
 import { applyTheme, getSettings } from './core/settings.js';
 import * as UI from './core/ui.js';
 import { esc } from './core/utils.js';
 import { openDB } from './db/idb.js';
 import * as Auth from './services/auth.js';
-import * as Catalog from './services/catalog.js';
+import { t, pick2, applyLanguage, toggleLanguage } from './i18n/i18n.js';
 
 const $ = window.jQuery;
 
-// Route table: name → [loader, title, permission|null, icon, menu section]
+// Route table: name → [loader, title key, icon, menu section, in side menu]
 const ROUTES = {
-  dashboard: [() => import('./modules/dashboard.js'), 'Dashboard', null, 'house', 'Main'],
-  pos: [() => import('./modules/pos.js'), 'New Sale', 'sale.create', 'cart-plus', 'Main'],
-  sales: [() => import('./modules/documents.js'), 'Sales', null, 'receipt', 'Main'],
-  purchase: [() => import('./modules/pos.js'), 'New Purchase', 'purchase.manage', null, null],
-  purchases: [() => import('./modules/documents.js'), 'Purchases', 'purchase.manage', 'bag', 'Main'],
-  returns: [() => import('./modules/documents.js'), 'Returns', null, 'arrow-return-left', 'Main'],
-  products: [() => import('./modules/products.js'), 'Products', null, 'box-seam', 'Inventory'],
-  stock: [() => import('./modules/stock.js'), 'Stock', null, 'boxes', 'Inventory'],
-  customers: [() => import('./modules/parties.js'), 'Customers', null, 'people', 'Parties'],
-  suppliers: [() => import('./modules/parties.js'), 'Suppliers', 'purchase.manage', 'truck', 'Parties'],
-  vouchers: [() => import('./modules/vouchers.js'), 'Cash Book & Payments', 'voucher.create', 'cash-coin', 'Accounts'],
-  accounts: [() => import('./modules/accounts.js'), 'Accounts', 'account.manage', 'bank', 'Accounts'],
-  reports: [() => import('./reports/reports.js'), 'Reports', 'reports.view', 'bar-chart-line', 'Accounts'],
-  backup: [() => import('./modules/backup.js'), 'Backup & Restore', 'backup.export', 'cloud-arrow-down', 'Administration'],
-  settings: [() => import('./modules/settings.js'), 'Settings', null, 'gear', 'Administration'],
+  home: [() => import('./modules/home.js'), 'nav.home', 'house-door-fill', 'main'],
+  new: [() => import('./modules/ticket-new.js'), 'nav.new', 'plus-circle-fill', 'main'],
+  tickets: [() => import('./modules/tickets.js'), 'nav.tickets', 'receipt', 'main'],
+  customers: [() => import('./modules/customers.js'), 'nav.customers', 'people', 'main'],
+  prices: [() => import('./modules/prices.js'), 'nav.prices', 'tags', 'manage'],
+  reports: [() => import('./modules/reports.js'), 'nav.reports', 'bar-chart-line', 'manage'],
+  settings: [() => import('./modules/settings.js'), 'nav.settings', 'gear', 'manage'],
 };
-const FOCUS_ROUTES = new Set(['pos', 'purchase']);
+const SECTIONS = ['main', 'manage'];
+const SECTION_LABEL = { main: 'nav.main', manage: 'nav.manage' };
 
 let currentModule = null;
 let routeToken = 0;
 let deferredInstall = null;
+let expiryTimer = null;
 
 function showView(name) {
   $('#splash').addClass('d-none');
@@ -61,7 +54,6 @@ function registerSW() {
     setInterval(check, 60 * 60 * 1000);
   }).catch((e) => console.warn('Service worker registration failed:', e));
   // Reload when an update replaces an existing worker, so the page never mixes files from two versions.
-  // (The very first install only takes control; nothing to reload.)
   let controlled = !!navigator.serviceWorker.controller;
   let reloading = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
@@ -71,7 +63,7 @@ function registerSW() {
 }
 
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; $('#install-btn').removeClass('d-none'); });
-window.addEventListener('appinstalled', () => { deferredInstall = null; $('#install-btn').addClass('d-none'); UI.toast('App installed'); });
+window.addEventListener('appinstalled', () => { deferredInstall = null; $('#install-btn').addClass('d-none'); UI.toast(t('install.done')); });
 export async function promptInstall() {
   if (!deferredInstall) return false;
   deferredInstall.prompt();
@@ -79,51 +71,62 @@ export async function promptInstall() {
   deferredInstall = null; $('#install-btn').addClass('d-none');
   return true;
 }
-export const canInstall = () => !!deferredInstall;
 
-// ---------- Connection badge ----------
+// ---------- Connection badge & language button ----------
 function renderConn(status) {
-  const map = { online: ['wifi', 'Online'], offline: ['wifi-off', 'Offline'] };
-  const [icon, label] = map[status] || map.offline;
-  $('#conn-badge').attr('class', `badge rounded-pill conn-${status}`).html(`<i class="bi bi-${icon}"></i> <span>${label}</span>`);
-  $('#login-conn').html(navigator.onLine ? '<i class="bi bi-wifi text-success"></i> Online' : '<i class="bi bi-wifi-off text-danger"></i> Offline — connect to the internet to sign in');
+  const online = status === 'online';
+  $('#conn-badge').attr('class', `badge rounded-pill conn-${online ? 'online' : 'offline'}`)
+    .html(`<i class="bi bi-${online ? 'wifi' : 'wifi-off'}"></i> <span>${esc(t(online ? 'conn.online' : 'conn.offline'))}</span>`);
+  $('#login-conn').html(navigator.onLine
+    ? `<i class="bi bi-wifi text-success"></i> ${esc(t('login.online'))}`
+    : `<i class="bi bi-wifi-off text-danger"></i> ${esc(t('login.offline'))}`);
 }
 window.addEventListener('online', () => renderConn('online'));
 window.addEventListener('offline', () => renderConn('offline'));
 
+const shopName = () => {
+  const b = getSettings().business;
+  return pick2({ en: b.name, ur: b.nameUr || b.name }, t('app.name'));
+};
+
+function updateBrand() {
+  $('#brand-name, #login-brand').text(shopName());
+}
+
 // ---------- Navigation ----------
 function buildMenu() {
-  let html = ''; let section = '';
-  for (const [name, [, title, perm, icon, sec]] of Object.entries(ROUTES)) {
-    if (!sec || (perm && !Auth.can(perm))) continue;
-    if (sec !== section) { section = sec; html += `<div class="nav-section">${esc(sec)}</div>`; }
-    html += `<a class="nav-link" href="#/${name}" data-route="${name}"><i class="bi bi-${icon}"></i>${esc(title)}</a>`;
+  let html = '';
+  for (const section of SECTIONS) {
+    html += `<div class="nav-section">${esc(t(SECTION_LABEL[section]))}</div>`;
+    for (const [name, [, title, icon, sec]] of Object.entries(ROUTES)) {
+      if (sec !== section) continue;
+      html += `<a class="nav-link" href="#/${name}" data-route="${name}"><i class="bi bi-${icon}"></i>${esc(t(title))}</a>`;
+    }
   }
   $('.nav-menu').html(html);
   const u = Auth.user();
-  $('#user-name').text(u.name);
-  $('#user-role').text(Auth.ROLES[u.role] || u.role);
-  $('#user-avatar').text(UI.initials(u.name));
-  $('#brand-name').text(getSettings().business.name || CONFIG.APP_NAME);
-  $('#bottom-nav [data-route="pos"]').toggleClass('d-none', !Auth.can('sale.create'));
+  $('#user-name').text(u?.name || '');
+  $('#user-avatar').text(UI.initials(u?.name || 'DC'));
+  $('#lang-btn').text(t('lang.switch')).attr('aria-label', t('lang.aria'));
+  $('#install-btn span').text(t('install.btn'));
+  updateBrand();
+  applyTheme();
 }
 
 async function route() {
   if (!Auth.user()) return;
   if (checkExpiry()) return;
   const token = ++routeToken;
-  const parts = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/').map(decodeURIComponent);
-  const name = ROUTES[parts[0]] ? parts[0] : 'dashboard';
-  const [loader, title, perm] = ROUTES[name];
+  const parts = (location.hash.replace(/^#\/?/, '') || 'home').split('/').map(decodeURIComponent);
+  const name = ROUTES[parts[0]] ? parts[0] : 'home';
+  const [loader, titleKey] = ROUTES[name];
   try { currentModule?.destroy?.(); } catch (e) { console.warn(e); }
   currentModule = null;
   bootstrap.Offcanvas.getInstance('#menu-offcanvas')?.hide();
   $('.nav-menu .nav-link, #bottom-nav a').removeClass('active');
   $(`.nav-menu [data-route="${name}"], #bottom-nav [data-route="${name}"]`).addClass('active');
-  $('body').toggleClass('focus-mode', FOCUS_ROUTES.has(name));
-  $('#topbar-title').text(title);
+  $('#topbar-title').text(t(titleKey));
   const $c = $('#content').off();
-  if (perm && !Auth.can(perm)) { $c.html(UI.emptyState('You do not have permission to open this page.', 'shield-lock')); return; }
   $c.html(UI.spinner());
   try {
     const mod = (await loader()).default;
@@ -131,7 +134,7 @@ async function route() {
     currentModule = mod;
     window.scrollTo(0, 0);
     $c.removeClass('page-enter');
-    await mod.render($c[0], { route: name, params: parts.slice(1), setTitle: (t) => $('#topbar-title').text(t) });
+    await mod.render($c[0], { route: name, params: parts.slice(1), setTitle: (x) => $('#topbar-title').text(x) });
     if (token === routeToken) { void $c[0].offsetWidth; $c.addClass('page-enter'); }
   } catch (e) {
     console.error(e);
@@ -141,7 +144,6 @@ async function route() {
 
 // ---------- Auth gate ----------
 async function startApp() {
-  await Catalog.load();
   buildMenu();
   showView('app');
   renderConn(navigator.onLine ? 'online' : 'offline');
@@ -152,7 +154,7 @@ async function startApp() {
 }
 
 async function doLogout(forced = false, reason = '') {
-  if (!forced && !await UI.confirmDialog('Log out of this device? Your POS data stays on this device, but signing in again requires an internet connection.', { okLabel: 'Log out', okClass: 'btn-danger' })) return;
+  if (!forced && !await UI.confirmDialog(t('auth.logoutConfirm'), { okLabel: t('auth.logoutOk'), okClass: 'btn-danger' })) return;
   clearInterval(expiryTimer);
   try { currentModule?.destroy?.(); } catch { /* ignore */ }
   currentModule = null;
@@ -162,56 +164,60 @@ async function doLogout(forced = false, reason = '') {
 }
 
 // Sessions are valid until expiresAt (set by the server); after that an online sign-in is required.
-let expiryTimer = null;
 function checkExpiry() {
   if (!Auth.sessionExpired()) return false;
-  UI.toast('Your session has expired. Please sign in again.', 'warning', 6000);
-  doLogout(true, 'Your session has expired. Connect to the internet and sign in again.');
+  UI.toast(t('auth.expired'), 'warning', 6000);
+  doLogout(true, t('auth.expired'));
   return true;
 }
 
 function showLogin(reason = '') {
   showView('login');
   renderConn(navigator.onLine ? 'online' : 'offline');
-  const notices = [];
-  if (reason) notices.push(esc(reason));
-  $('#login-notice').toggleClass('d-none', !notices.length).html(notices.join('<br>'));
+  $('#login-notice').toggleClass('d-none', !reason).text(reason);
   setTimeout(() => $('#login-username').trigger('focus'), 50);
 }
 
 $('#login-form').on('submit', async (e) => {
   e.preventDefault();
-  const $btn = $('#login-btn').prop('disabled', true).html('<span class="spinner-border spinner-border-sm"></span><span>Signing in…</span>');
+  const $btn = $('#login-btn').prop('disabled', true).html(`<span class="spinner-border spinner-border-sm"></span><span>${esc(t('login.busy'))}</span>`);
   $('#login-error').addClass('d-none');
   try {
     await Auth.login($('#login-username').val(), $('#login-password').val());
     $('#login-password').val('');
     await startApp();
   } catch (err) {
-    $('#login-error').text(err.message || String(err)).removeClass('d-none');
+    $('#login-error').text(err.message || t('common.error')).removeClass('d-none');
     $('.auth-card').removeClass('shake'); void $('.auth-card')[0].offsetWidth; $('.auth-card').addClass('shake');
-  } finally { $btn.prop('disabled', false).html('<span>Sign in</span><i class="bi bi-arrow-right"></i>'); }
+  } finally { $btn.prop('disabled', false).html(`<span>${esc(t('login.submit'))}</span><i class="bi bi-arrow-right"></i>`); }
 });
 $('#toggle-pw').on('click', () => {
   const $i = $('#login-password'); const show = $i.attr('type') === 'password';
   $i.attr('type', show ? 'text' : 'password');
   $('#toggle-pw i').attr('class', show ? 'bi bi-eye-slash' : 'bi bi-eye');
 });
+$('#lang-btn, #login-lang-btn').on('click', toggleLanguage);
 $('#logout-btn').on('click', () => doLogout(false));
 $('#install-btn').on('click', promptInstall);
 window.addEventListener('hashchange', route);
-document.addEventListener('settings:changed', () => { applyTheme(); if (Auth.user()) $('#brand-name').text(getSettings().business.name || CONFIG.APP_NAME); });
-document.addEventListener('auth:changed', () => { if (Auth.user()) buildMenu(); });
+document.addEventListener('settings:changed', () => { applyTheme(); if (Auth.user()) updateBrand(); });
+document.addEventListener('lang:changed', () => {
+  renderConn(navigator.onLine ? 'online' : 'offline');
+  if (Auth.user()) { buildMenu(); route(); }
+});
+document.addEventListener('data:changed', () => { if (Auth.user()) route(); });
+document.addEventListener('app:logout', () => doLogout(false));
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyTheme);
 
 // ---------- Boot ----------
 (async function boot() {
+  applyLanguage();
   applyTheme();
   registerSW();
-  if (!window.jQuery || !window.bootstrap) return fatal('Required libraries failed to load. Connect to the internet once so the app can be cached for offline use.');
-  try { await openDB(); } catch (e) { return fatal('Could not open the local database: ' + (e.message || e)); }
+  if (!window.jQuery || !window.bootstrap) return fatal(t('common.error'));
+  try { await openDB(); } catch (e) { return fatal(e.message || String(e)); }
   const { user, reason } = Auth.restoreSession();
   if (user) {
     try { await startApp(); } catch (e) { console.error(e); fatal(e.message || String(e)); }
-  } else showLogin(reason);
+  } else showLogin(reason || '');
 })();

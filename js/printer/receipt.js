@@ -1,50 +1,37 @@
-// Builds a printer-independent receipt model and renders it to ESC/POS bytes or HTML.
-import * as idb from '../db/idb.js';
+// Builds a printer-independent ticket receipt and renders it to ESC/POS bytes or HTML.
 import { getSettings } from '../core/settings.js';
-import { fmtNum, fmtQty, fmtDateTime, fmtDate, esc, localDate } from '../core/utils.js';
+import { fmtNum, fmtQty, esc } from '../core/utils.js';
 import { EscPos, isPlain } from './escpos.js';
 import * as Raster from './raster.js';
+import { t, pick2 } from '../i18n/i18n.js';
+import { fmtDate, fmtDateTime, phoneText, statusLabel } from '../dc/format.js';
 
-const TITLES = { sale: 'SALES RECEIPT', purchase: 'PURCHASE', saleReturn: 'SALE RETURN', purchaseReturn: 'PURCHASE RETURN', receipt: 'PAYMENT RECEIPT', payment: 'PAYMENT VOUCHER', transfer: 'TRANSFER' };
-
-export async function buildReceipt(kind, doc) {
+// Ticket receipt: the customer's copy, shown in the language the counter is using.
+export function buildTicketReceipt(tk) {
   const s = getSettings();
   const b = s.business;
-  const m = { header: [b.name, b.address, b.phone ? 'Tel: ' + b.phone : '', b.taxNo ? 'Tax No: ' + b.taxNo : ''].filter(Boolean), title: TITLES[kind] || kind.toUpperCase(),
-    info: [], items: [], totals: [], footer: b.footer || '', void: doc.status === 'void' };
-  const sameDay = doc.createdAt && localDate(new Date(doc.createdAt)) === doc.date;
-  m.info.push(['No', doc.number], ['Date', sameDay ? fmtDateTime(doc.createdAt) : fmtDate(doc.date)]);
-  if (doc.userName) m.info.push(['User', doc.userName]);
-
-  if (kind === 'sale' || kind === 'purchase') {
-    const items = await idb.getAllByIndex(kind === 'sale' ? 'saleItems' : 'purchaseItems', kind === 'sale' ? 'saleId' : 'purchaseId', doc.id);
-    const list = items.length ? items : (doc.voidedItems || []);
-    list.sort((a, b) => a.line - b.line);
-    m.info.push([kind === 'sale' ? 'Customer' : 'Supplier', kind === 'sale' ? doc.customerName : doc.supplierName]);
-    m.items = list.map((i) => ({ name: i.name, qty: i.qty, unit: i.unit, rate: i.rate, discount: i.discount, amount: i.amount }));
-    m.totals.push(['Subtotal', doc.subtotal]);
-    if (doc.discount) m.totals.push(['Discount', -doc.discount]);
-    if (doc.tax) m.totals.push([`Tax (${doc.taxRate}%)`, doc.tax]);
-    m.totals.push(['TOTAL', doc.total, true]);
-    if (kind === 'sale' && doc.tendered > doc.paid) m.totals.push(['Cash tendered', doc.tendered]);
-    m.totals.push(['Paid', doc.paid]);
-    if (doc.change) m.totals.push(['Change', doc.change]);
-    if (doc.balance) m.totals.push(['Balance due', doc.balance, true]);
-    m.payment = doc.paid ? doc.paymentAccountName : 'Credit';
-  } else if (kind === 'saleReturn' || kind === 'purchaseReturn') {
-    m.info.push(['Against', doc.docNo], [kind === 'saleReturn' ? 'Customer' : 'Supplier', doc.partyName || '']);
-    m.items = doc.items.map((i) => ({ name: i.name, qty: i.qty, unit: i.unit, rate: i.rate, amount: i.amount }));
-    m.totals.push(['RETURN TOTAL', doc.total, true]);
-    m.totals.push([kind === 'saleReturn' ? 'Refunded' : 'Refund received', doc.refund]);
-    m.payment = doc.refund ? doc.refundAccountName : 'Adjusted to account';
-  } else {
-    const party = { receipt: 'Received from', payment: 'Paid to', transfer: 'To account' }[doc.type];
-    m.title = TITLES[doc.type];
-    m.info.push([party, doc.counterName], [doc.type === 'transfer' ? 'From account' : 'Account', doc.accountName]);
-    if (doc.note) m.info.push(['Note', doc.note]);
-    m.totals.push(['AMOUNT', doc.amount, true]);
-  }
-  if (doc.note && kind !== 'voucher') m.note = doc.note;
+  const shop = pick2({ en: b.name, ur: b.nameUr || b.name }, t('app.name'));
+  const m = {
+    header: [shop, b.address, b.phone ? `${t('common.phone')}: ${phoneText(b.phone)}` : ''].filter(Boolean),
+    title: t('tickets.title') + ' — ' + t('tickets.number') + ' ' + tk.number,
+    info: [
+      [t('tickets.customer'), tk.customerName],
+      [t('common.phone'), phoneText(tk.customerPhone)],
+      [t('tickets.received'), fmtDateTime(tk.createdAt)],
+      [t('tickets.due'), tk.dueDate ? fmtDate(tk.dueDate) : '—'],
+      [t('tickets.status'), statusLabel(tk.status)],
+    ],
+    items: tk.items.map((i) => ({ name: pick2(i.name) + ' · ' + t(`svc.${i.service}`), qty: i.qty, unit: '', rate: i.rate, amount: i.amount })),
+    totals: [],
+    footer: b.footer || '',
+    void: false,
+  };
+  if (tk.urgent) m.totals.push([t('tickets.urgent'), tk.surcharge]);
+  m.totals.push([t('tickets.total'), tk.total, true]);
+  m.totals.push([t('tickets.advance'), tk.paid]);
+  m.totals.push([t('tickets.balance'), tk.balance, true]);
+  if (tk.payments?.length) m.payment = tk.payments.map((p) => t(`tickets.${p.method}`)).join(', ');
+  if (tk.note) m.note = tk.note;
   return m;
 }
 
@@ -55,22 +42,20 @@ export async function toEscPos(m, width = 58) {
   const cur = getSettings().currency;
   p.align('center');
   m.header.forEach((h, i) => { if (i === 0) p.bold(true).size(true).wrap(h, Math.floor(p.cols / 2)).size(false).bold(false); else p.wrap(h); });
-  p.hr().bold(true).line(m.title).bold(false);
-  if (m.void) p.bold(true).line('*** VOID ***').bold(false);
+  p.hr().bold(true).wrap(m.title).bold(false);
   p.align('left');
-  m.info.forEach(([k, v]) => p.lr(k + ':', String(v ?? '')));
+  m.info.forEach(([k, v]) => { if (k) p.lr(k + ':', String(v ?? '')); });
   if (m.items.length) {
     p.hr();
     m.items.forEach((i) => {
       p.wrap(i.name);
-      p.lr(`  ${fmtQty(i.qty)} ${i.unit || ''} x ${fmtNum(i.rate)}`, fmtNum(i.amount));
-      if (i.discount) p.lr('  Discount', '-' + fmtNum(i.discount));
+      p.lr(`  ${fmtQty(i.qty)} x ${fmtNum(i.rate)}`, fmtNum(i.amount));
     });
   }
   p.hr();
   m.totals.forEach(([k, v, strong]) => { if (strong) p.bold(true); p.lr(k, `${v < 0 ? '-' : ''}${cur} ${fmtNum(Math.abs(v))}`); if (strong) p.bold(false); });
-  if (m.payment) p.lr('Payment', m.payment);
-  if (m.note) { p.hr(); p.wrap('Note: ' + m.note); }
+  if (m.payment) p.lr(t('tickets.method'), m.payment);
+  if (m.note) { p.hr(); p.wrap(m.note); }
   p.hr().align('center');
   if (m.footer) p.wrap(m.footer);
   p.feed(3).cut();
@@ -78,18 +63,18 @@ export async function toEscPos(m, width = 58) {
 }
 
 // Urdu/RTL text is wrapped so it uses Jameel Noori Nastaleeq and right-to-left layout.
-const t = (s) => (isPlain(s) ? esc(s) : `<span class="ur" dir="auto">${esc(s)}</span>`);
+const tx = (s) => (isPlain(s) ? esc(s) : `<span class="ur" dir="auto">${esc(s)}</span>`);
 
 export function toHTML(m, width = 58) {
   const cur = esc(getSettings().currency);
   const row = (l, r, cls = '') => `<tr class="${cls}"><td>${l}</td><td class="r">${r}</td></tr>`;
   return `<div class="receipt w${Number(width) === 80 ? 80 : 58}">
-    ${m.header.map((h, i) => `<div class="c ${i === 0 ? 'b big' : ''}">${t(h)}</div>`).join('')}
-    <hr><div class="c b">${esc(m.title)}</div>${m.void ? '<div class="c b">*** VOID ***</div>' : ''}
-    <table>${m.info.map(([k, v]) => row(esc(k) + ':', t(v))).join('')}</table>
-    ${m.items.length ? '<hr><table>' + m.items.map((i) => `<tr><td colspan="2">${t(i.name)}</td></tr>${row(`&nbsp;&nbsp;${fmtQty(i.qty)} ${esc(i.unit || '')} x ${fmtNum(i.rate)}`, fmtNum(i.amount))}${i.discount ? row('&nbsp;&nbsp;Discount', '-' + fmtNum(i.discount)) : ''}`).join('') + '</table>' : ''}
-    <hr><table>${m.totals.map(([k, v, strong]) => row(esc(k), `${v < 0 ? '-' : ''}${cur} ${fmtNum(Math.abs(v))}`, strong ? 'b' : '')).join('')}
-    ${m.payment ? row('Payment', t(m.payment)) : ''}</table>
-    ${m.note ? `<hr><div>Note: ${t(m.note)}</div>` : ''}
-    <hr>${m.footer ? `<div class="c">${t(m.footer)}</div>` : ''}</div>`;
+    ${m.header.map((h, i) => `<div class="c ${i === 0 ? 'b big' : ''}">${tx(h)}</div>`).join('')}
+    <hr><div class="c b">${tx(m.title)}</div>
+    <table>${m.info.filter(([k]) => k).map(([k, v]) => row(esc(k) + ':', tx(v))).join('')}</table>
+    ${m.items.length ? '<hr><table>' + m.items.map((i) => `<tr><td colspan="2">${tx(i.name)}</td></tr>${row(`&nbsp;&nbsp;${fmtQty(i.qty)} x ${fmtNum(i.rate)}`, fmtNum(i.amount))}`).join('') + '</table>' : ''}
+    <hr><table>${m.totals.map(([k, v, strong]) => row(tx(k), `${v < 0 ? '-' : ''}${cur} ${fmtNum(Math.abs(v))}`, strong ? 'b' : '')).join('')}</table>
+    ${m.payment ? `<div>${esc(t('tickets.method'))}: ${tx(m.payment)}</div>` : ''}
+    ${m.note ? `<hr><div>${tx(m.note)}</div>` : ''}
+    <hr>${m.footer ? `<div class="c">${tx(m.footer)}</div>` : ''}</div>`;
 }

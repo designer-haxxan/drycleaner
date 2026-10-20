@@ -1,28 +1,29 @@
-/* Service worker: precaches the app shell and CDN libraries so the POS loads fully offline.
+/* Service worker: precaches the app shell and CDN libraries so the app loads fully offline.
    Bump VERSION whenever any cached file changes; clients update automatically. */
 // Cache names are namespaced: other apps on designer-haxxan.github.io share Cache Storage with this one.
-const APP_ID = 'disterp';
-const VERSION = `${APP_ID}-v1.3.2`;
-const isOwnCache = (key) => key.startsWith(`${APP_ID}-`) || /^saleapp-v/.test(key); // saleapp-v* = this app's older builds
+const APP_ID = 'drycleaner';
+const VERSION = `${APP_ID}-v2.0.0`;
+const isOwnCache = (key) => key.startsWith(`${APP_ID}-v`);
 const SHELL = [
   './', './index.html', './manifest.json', './css/app.css',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png', './icons/apple-touch-icon.png', './icons/favicon-32.png',
   './js/app.js', './js/config.js',
-  './js/core/link-login.js', './js/core/settings.js', './js/core/ui.js', './js/core/utils.js', './js/core/views.js',
+  './js/core/link-login.js', './js/core/settings.js', './js/core/ui.js', './js/core/utils.js',
   './js/db/idb.js', './js/db/schema.js',
-  './js/modules/accounts.js', './js/modules/backup.js', './js/modules/dashboard.js', './js/modules/documents.js',
-  './js/modules/parties.js', './js/modules/pos.js', './js/modules/products.js', './js/modules/settings.js', './js/modules/stock.js', './js/modules/vouchers.js',
+  './js/i18n/i18n.js', './js/i18n/strings.js',
+  './js/dc/catalog.js', './js/dc/format.js', './js/dc/data.js', './js/dc/backup.js',
+  './js/modules/home.js', './js/modules/ticket-new.js', './js/modules/tickets.js', './js/modules/customers.js',
+  './js/modules/prices.js', './js/modules/reports.js', './js/modules/settings.js',
   './js/printer/escpos.js', './js/printer/printer.js', './js/printer/raster.js', './js/printer/receipt.js',
-  './js/reports/reports.js', './js/scanner/scanner.js',
-  './js/services/auth.js', './js/services/backup.js', './js/services/catalog.js', './js/services/posting.js',
+  './js/services/auth.js',
 ];
 const CDN = [
   'https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css',
+  'https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css',
   'https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js',
   'https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css',
   'https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.1.0/index.css',
   'https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js',
-  'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js',
 ];
 
 async function cacheCdn(cache) {
@@ -31,7 +32,7 @@ async function cacheCdn(cache) {
       const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'reload' });
       if (!res.ok) continue;
       await cache.put(url, res.clone());
-      // Also cache fonts referenced by stylesheets (Bootstrap Icons).
+      // Also cache fonts referenced by stylesheets (Bootstrap Icons, Inter).
       if (url.endsWith('.css')) {
         const css = await res.text();
         for (const m of css.matchAll(/url\(["']?([^"')]+\.woff2?[^"')]*)["']?\)/g)) {
@@ -56,7 +57,7 @@ async function precache() {
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     await precache();
-    // Activate new versions immediately; open pages reload on controllerchange (POS carts are kept as drafts).
+    // Activate new versions immediately; open pages reload on controllerchange (drafts are kept).
     await self.skipWaiting();
   })());
 });

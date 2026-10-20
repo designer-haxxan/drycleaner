@@ -3,7 +3,8 @@
 import { getSettings, saveSettings } from '../core/settings.js';
 import { AppError, esc } from '../core/utils.js';
 import * as UI from '../core/ui.js';
-import { buildReceipt, toEscPos, toHTML } from './receipt.js';
+import { toEscPos, toHTML } from './receipt.js';
+import { t } from '../i18n/i18n.js';
 import { EscPos } from './escpos.js';
 import * as Raster from './raster.js';
 import { ensureFont, isRTL } from './raster.js';
@@ -202,15 +203,14 @@ async function output(bytesFn, htmlFn, width) {
   return printHTML(htmlFn(), { width });
 }
 
-// Print a document receipt. Falls back to the browser dialog if the chosen printer fails.
-export async function printDocument(kind, doc, { silentFail = false } = {}) {
+// Print a receipt model (see dc/receipt.js). Falls back to the browser dialog if the chosen printer fails.
+export async function printModel(model, { silentFail = false } = {}) {
   const { width, copies } = getSettings().printer;
-  const model = await buildReceipt(kind, doc);
   try {
     for (let i = 0; i < Math.max(1, Math.min(5, copies || 1)); i++) await output(() => toEscPos(model, width), () => toHTML(model, width), width);
   } catch (e) {
-    if (silentFail) { UI.toast(`Print failed: ${e.message}`, 'warning', 5000); return false; }
-    if (await UI.confirmDialog(`${e.message}\n\nPrint using the browser print dialog instead?`, { okLabel: 'Browser print' })) {
+    if (silentFail) { UI.toast(`${t('common.error')} ${e.message}`, 'warning', 5000); return false; }
+    if (await UI.confirmDialog(`${e.message}\n\n${t('tickets.printFallback')}`, { okLabel: t('common.print') })) {
       printHTML(toHTML(model, width), { width });
     }
     return false;
